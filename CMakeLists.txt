@@ -53,9 +53,17 @@ ament_target_dependencies(read_wireless_controller ${DEPENDENCY_LIST})
 # go2
 add_executable(pathtracking_node src/go2/pathtracking_node.cpp src/common/go2_move_client.cpp)
 # target_compile_features(pathtracking_node PRIVATE cxx_std_20)
+add_executable(test_node src/test_track_node.cpp)
 
 ament_target_dependencies(pathtracking_node ${DEPENDENCY_LIST})
 target_link_libraries(pathtracking_node Eigen3::Eigen)
+
+ament_target_dependencies(test_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+)
+
 
 
 install(TARGETS 
@@ -63,6 +71,7 @@ install(TARGETS
         read_motion_state
         read_wireless_controller
         pathtracking_node
+        test_node
         DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
