@@ -149,12 +149,27 @@ public:
     }
 
     void responsecallback(const unitree_api::msg::Response::SharedPtr msg) {
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] API Response - ID: %d, Code: %d", 
-                   msg->header.identity.api_id, msg->header.status.code);
+        auto api_id = msg->header.identity.api_id;
+        auto code = msg->header.status.code;
         
-        if (msg->header.status.code != 0) {
-            RCLCPP_ERROR(this->get_logger(), "[PathTracking] API call failed with error code: %d", 
-                        msg->header.status.code);
+        // Only process MOVE and TRAJECTORYFOLLOW API responses
+        if (api_id == ROBOT_SPORT_API_ID_MOVE || api_id == ROBOT_SPORT_API_ID_TRAJECTORYFOLLOW) {
+            std::string api_name = (api_id == ROBOT_SPORT_API_ID_MOVE) ? "MOVE" : "TRAJECTORYFOLLOW";
+            std::string code_desc;
+            
+            switch (code) {
+                case 0: code_desc = "success"; break;
+                case -1: code_desc = "task timeout"; break;
+                case -2: code_desc = "task unknown error"; break;
+                default: code_desc = "unknown"; break;
+            }
+            
+            RCLCPP_INFO(this->get_logger(), "[PathTracking] API Response - ID: %d (%s), Code: %d (%s)", 
+                       api_id, api_name.c_str(), code, code_desc.c_str());
+            
+            if (code != 0) {
+                RCLCPP_ERROR(this->get_logger(), "[PathTracking] API call failed: %s", code_desc.c_str());
+            }
         }
     }
 
