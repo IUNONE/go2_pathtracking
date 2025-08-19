@@ -63,7 +63,7 @@ install(TARGETS
         read_motion_state
         read_wireless_controller
         pathtracking_node
-        DESTINATION)
+        DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
