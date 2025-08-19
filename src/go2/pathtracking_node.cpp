@@ -115,6 +115,10 @@ public:
             plan_path_(i, 2) = yaw;
         }
         
+        // Debug: print first point before transformation
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point before transform - local: x=%.3f, y=%.3f, yaw=%.3f", 
+                   plan_path_(0, 0), plan_path_(0, 1), plan_path_(0, 2));
+        
         // transform planned path from local to global 
         Eigen::MatrixXd traj_global(N, 3);
         Eigen::Matrix2d R;
@@ -127,8 +131,13 @@ public:
         
         plan_path_ = traj_global;
         
+        // Debug: print first point after transformation
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point after transform - global: x=%.3f, y=%.3f, yaw=%.3f", 
+                   plan_path_(0, 0), plan_path_(0, 1), plan_path_(0, 2));
+        
         // apply api if needed
         if (api_mode_ == "pos") {
+            RCLCPP_INFO(this->get_logger(), "[PathTracking] Calling FollowTrajApi()");
             FollowTrajApi();
         } else if (api_mode_ == "vel") {
             path_start_time_ = this->get_clock()->now();
@@ -205,6 +214,8 @@ public:
         Eigen::MatrixXd traj_aug(N+1, 3);
         traj_aug << current, plan_path_copy;  
         Eigen::MatrixXd vel = (traj_aug.bottomRows(N) - traj_aug.topRows(N)) / traj_interval_s_;
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] Compute vel - global: vx=%.3f, vy=%.3f, vyaw=%.3f", 
+                   vel(0, 0), vel(0, 1), vel(0, 2));
 
         // ----------------------------------------------------------
         // convert to api format
@@ -240,7 +251,6 @@ public:
                 path[0].x, path[0].y, path[0].yaw, path[0].vx, path[0].vy, path[0].vyaw);
         }
         
-        // Send trajectory follow command
         try {
             move_client_.TrajectoryFollow(req_, path);
             RCLCPP_INFO(this->get_logger(), "[PathTracking] TrajectoryFollow api sent successfully");
