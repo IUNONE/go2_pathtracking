@@ -348,20 +348,42 @@ int main(int argc, char **argv) {
     
     // Wait for the first state message to safely get the initial pose
     RCLCPP_INFO(node->get_logger(), "Waiting for the first state message on /lf/sportmodestate...");
-    unitree_go::msg::SportModeState::SharedPtr init_state_msg;
-    try {
-        init_state_msg = rclcpp::topic::wait_for_message<unitree_go::msg::SportModeState>(
-            "/lf/sportmodestate", node, std::chrono::seconds(5));
-    } catch (const rclcpp::exceptions::RCLError &e) {
-        RCLCPP_ERROR(node->get_logger(), "Failed to get initial state: %s", e.what());
-        rclcpp::shutdown();
-        return -1;
+    
+    unitree_go::msg::SportModeState::SharedPtr init_state_msg = nullptr;
+    bool received_initial_state = false;
+    
+    // Create temporary subscription to wait for first message
+    auto temp_sub = node->create_subscription<unitree_go::msg::SportModeState>(
+        "/lf/sportmodestate", 1,
+        [&](const unitree_go::msg::SportModeState::SharedPtr msg) {
+            init_state_msg = msg;
+            received_initial_state = true;
+        });
+    
+    // Wait for initial state with timeout
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::seconds(5);
+    
+    while (!received_initial_state && rclcpp::ok()) {
+        rclcpp::spin_some(node);
+        
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        if (elapsed > timeout) {
+            RCLCPP_ERROR(node->get_logger(), "Timed out waiting for initial state message.");
+            rclcpp::shutdown();
+            return -1;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    // Remove temporary subscription
+    temp_sub.reset();
     
     if (init_state_msg) {
         node->SetInitState(*init_state_msg);
     } else {
-        RCLCPP_ERROR(node->get_logger(), "Timed out waiting for initial state message.");
+        RCLCPP_ERROR(node->get_logger(), "Failed to get initial state message.");
         rclcpp::shutdown();
         return -1;
     }
