@@ -39,13 +39,15 @@ public:
         this->declare_parameter<std::string>("api", "pos");
         this->declare_parameter<std::string>("strategy", "open_loop");
         this->declare_parameter<int>("control_hz", 50);
+        this->declare_parameter<bool>("is_ai_ctl", true);
 
         api_mode_ = this->get_parameter("api").as_string();
         strategy_ = this->get_parameter("strategy").as_string();
         control_hz_ = this->get_parameter("control_hz").as_int();
+        is_ai_ctl_ = this->get_parameter("is_ai_ctl").as_bool();
 
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] API mode: %s, Strategy: %s, Control Hz: %d", 
-                   api_mode_.c_str(), strategy_.c_str(), control_hz_);
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] API mode: %s, Strategy: %s, Control Hz: %d, AI Control: %s", 
+                   api_mode_.c_str(), strategy_.c_str(), control_hz_, is_ai_ctl_ ? "true" : "false");
         
         // --------------------------------------------------------------------------------
         // subscribers
@@ -93,13 +95,14 @@ public:
         size_t N = msg->poses.size();
         if (N == 0) {
             RCLCPP_WARN(this->get_logger(), "Received empty path.");
-            plan_path_.resize(0, 3);
+            plan_path_local_.resize(0, 3);
+            plan_path_global_.resize(0, 3);
             return;
         }
         RCLCPP_INFO(this->get_logger(), "[PathTracking] Received planned path ros2 msg with %zu points ", N);
 
         // extract x, y, yaw from ros msg
-        plan_path_.resize(N, 3);
+        plan_path_local_.resize(N, 3);
         for (size_t i = 0; i < N; ++i) {
             const auto& pose = msg->poses[i].pose;
 
@@ -110,30 +113,30 @@ public:
                 pose.orientation.w);
             double roll, pitch, yaw;
             tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
-            plan_path_(i, 0) = pose.position.x;
-            plan_path_(i, 1) = pose.position.y;
-            plan_path_(i, 2) = yaw;
+            plan_path_local_(i, 0) = pose.position.x;
+            plan_path_local_(i, 1) = pose.position.y;
+            plan_path_local_(i, 2) = yaw;
         }
         
         // Debug: print first point before transformation
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point before transform - local: x=%.3f, y=%.3f, yaw=%.3f", 
-                   plan_path_(0, 0), plan_path_(0, 1), plan_path_(0, 2));
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point local: x=%.3f, y=%.3f, yaw=%.3f", 
+                plan_path_local_(0, 0), plan_path_local_(0, 1), plan_path_local_(0, 2));
         
         // transform planned path from local to global 
         Eigen::MatrixXd traj_global(N, 3);
         Eigen::Matrix2d R;
         R << cos(yaw0_), -sin(yaw0_),
             sin(yaw0_),  cos(yaw0_);
-        Eigen::MatrixXd XY_local =  plan_path_.leftCols(2).transpose();
+        Eigen::MatrixXd XY_local =  plan_path_local_.leftCols(2).transpose();
         Eigen::MatrixXd XY_global = (R * XY_local).colwise() + Eigen::Vector2d(px0_, py0_);
         traj_global.leftCols(2) = XY_global.transpose();
-        traj_global.col(2) = plan_path_.col(2).array() + yaw0_;
+        traj_global.col(2) = plan_path_local_.col(2).array() + yaw0_;
         
-        plan_path_ = traj_global;
+        plan_path_global_ = traj_global;
         
         // Debug: print first point after transformation
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point after transform - global: x=%.3f, y=%.3f, yaw=%.3f", 
-                   plan_path_(0, 0), plan_path_(0, 1), plan_path_(0, 2));
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point global: x=%.3f, y=%.3f, yaw=%.3f", 
+                plan_path_global_(0, 0), plan_path_global_(0, 1), plan_path_global_(0, 2));
         
         // apply api if needed
         if (api_mode_ == "pos") {
@@ -192,14 +195,28 @@ public:
             px0_, py0_, yaw0_);
     }
 
+    void ClampVelocity(double& vx, double& vy, double& vyaw) {
+        if (is_ai_ctl_) {
+            // AI control limits
+            vx = std::clamp(vx, -0.6, 0.6);
+            vy = std::clamp(vy, -0.4, 0.4);
+            vyaw = std::clamp(vyaw, -0.8, 0.8);
+        } else {
+            // Non-AI control limits
+            vx = std::clamp(vx, -2.5, 3.8);
+            vy = std::clamp(vy, -1.0, 1.0);
+            vyaw = std::clamp(vyaw, -4.0, 4.0);
+        }
+    }
 
+    // trajectory following api need global coord
     void FollowTrajApi() {
         Eigen::MatrixXd plan_path_copy;
         unitree_go::msg::SportModeState state_copy;
         {
             // Use C++17 structured binding to lock two mutexes safely
             std::scoped_lock lock(path_mutex_, state_mutex_);
-            plan_path_copy = plan_path_;
+            plan_path_copy = plan_path_global_;
             state_copy = state_;
         }
 
@@ -231,6 +248,9 @@ public:
                 path_point.vx = vel(i, 0);
                 path_point.vy = vel(i, 1);
                 path_point.vyaw = vel(i, 2);
+                
+                // Apply velocity limits
+                ClampVelocity(path_point.vx, path_point.vy, path_point.vyaw);
             } else {
                 // repeat the last one
                 path_point.x = path.back().x;
@@ -259,6 +279,7 @@ public:
         }
     }
 
+    // velocity following api need local coord
     void MoveApiControlLoop() {
         rclcpp::Rate rate(control_hz_);
         
@@ -267,7 +288,7 @@ public:
             unitree_go::msg::SportModeState state_copy;
             {
                 std::scoped_lock lock(path_mutex_, state_mutex_);
-                plan_path_copy = plan_path_;
+                plan_path_copy = plan_path_local_;
                 state_copy = state_;
             }
             int n_pts = plan_path_copy.rows();
@@ -309,9 +330,7 @@ public:
                     vx = vy = vyaw = 0.0;
                 }
 
-                vx = std::clamp(vx, -3.0, 3.0);
-                vy = std::clamp(vy, -3.0, 3.0);
-                vyaw = std::clamp(vyaw, -3.0, 3.0);
+                ClampVelocity(vx, vy, vyaw);
 
                 try {
                     move_client_.Move(req_, vx, vy, vyaw);
@@ -336,6 +355,7 @@ private:
     std::string api_mode_;
     std::string strategy_;
     int control_hz_;
+    bool is_ai_ctl_;
     
     double kp_linear_ = 2.0;
     double kp_angular_ = 1.5;
@@ -356,7 +376,8 @@ private:
     // plan path
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr plan_path_suber_;
     std::mutex path_mutex_;
-    Eigen::MatrixXd plan_path_;    // [n, 3]  x, y, yaw in local
+    Eigen::MatrixXd plan_path_local_;       // [n, 3]  x, y, yaw in local
+    Eigen::MatrixXd plan_path_global_;      // [n, 3]  x, y, yaw in global
 
     // VEL TRACK
     int target_point_idx_ = -1;
