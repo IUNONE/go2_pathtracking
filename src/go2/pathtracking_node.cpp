@@ -13,6 +13,8 @@
 #include "nav_msgs/msg/path.hpp"
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include "unitree_go/msg/sport_mode_state.hpp"
 #include "unitree_api/msg/response.hpp"
@@ -87,6 +89,7 @@ public:
         path_topic_ = declare_parameter<std::string>("path_topic", "/planned_path");
 
         // --------------------------------------------------------------------------------
+        using std::placeholders::_1;
         state_suber_ = this->create_subscription<unitree_go::msg::SportModeState>(
             "lf/sportmodestate", 
             20,
@@ -381,7 +384,7 @@ private:
         yaw_vel = std::clamp(yaw_vel, -max_vel_yaw_, max_vel_yaw_);
     }
 
-    std::pair<double, double, double> calculate_openloop_control(double elapsed_time){
+    std::tuple<double, double, double> calculate_openloop_control(double elapsed_time){
         
         double subgoal_idx = elapsed_time / path_dt_;
         size_t cur_idx = static_cast<size_t>(subgoal_idx);
@@ -390,10 +393,10 @@ private:
         double y_vel = plan_path_local_(cur_idx,4);
         double angular_vel = plan_path_local_(cur_idx,5);
 
-        return {x_vel, y_vel, angular_vel};
+        return std::make_tuple(x_vel, y_vel, angular_vel);
     }
 
-    std::pair<double, double, double> calculate_pd_control(double elapsed_time){
+    std::tuple<double, double, double> calculate_pd_control(double elapsed_time){
         
         size_t subgoal_idx = static_cast<size_t>(elapsed_time / path_dt_) + 1;
         
@@ -456,7 +459,7 @@ private:
         double y_vel = -total_desired_vel[0] * sin(dyaw) + total_desired_vel[1] * cos(dyaw);
         double angular_vel = total_desired_vel[2];
 
-        return {x_vel, y_vel, angular_vel};
+        return std::make_tuple(x_vel, y_vel, angular_vel);
     }
 
     //----------------------------------------------------------

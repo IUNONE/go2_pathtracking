@@ -1,4 +1,7 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.5  tf2_ros
+  tf2_msgs
+  geometry_msgs
+)
 project(go2_pathtracking)
 
 # Default to C99
@@ -38,7 +41,10 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_msgs REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 
