@@ -1,6 +1,6 @@
 #include "go2_move_client.h"
 
-void SportClient::BalanceStand(unitree_api::msg::Request &req) {
+void Go2MoveClient::BalanceStand(unitree_api::msg::Request &req) {
   req.header.identity.api_id = ROBOT_SPORT_API_ID_BALANCESTAND;
   req_puber_->publish(req);
 }
