@@ -15,7 +15,7 @@
 #include "time_tools.hpp"
 #include "ut_errror.hpp"
 
-
+const int32_t ROBOT_SPORT_API_ID_BALANCESTAND = 1002;
 const int32_t ROBOT_SPORT_API_ID_STOPMOVE = 1003;
 const int32_t ROBOT_SPORT_API_ID_MOVE = 1008;
 const int32_t ROBOT_SPORT_API_ID_SPEEDLEVEL = 1015;
@@ -81,6 +81,12 @@ class Go2MoveClient {
       return UT_ROBOT_TASK_UNKNOWN_ERROR;
     }
   }
+
+  /*
+   * @brief BalanceStand
+   * @api: 1002
+   */
+  void BalanceStand(unitree_api::msg::Request &req);
 
   /*
    * @brief StopMove

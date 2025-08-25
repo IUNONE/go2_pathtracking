@@ -19,238 +19,300 @@
 
 #include "go2_move_client.h"
 
-using std::placeholders::_1;
 
-// Custom angle utility functions for Foxy compatibility
-namespace angle_utils {
-    inline double shortest_angular_distance(double from, double to) {
-        double diff = to - from;
-        while (diff > M_PI) diff -= 2.0 * M_PI;
-        while (diff < -M_PI) diff += 2.0 * M_PI;
-        return diff;
+// Global variables for signal handling
+std::atomic<bool> g_emergency_stop{false};
+
+// Signal handler for Ctrl+C
+void signal_handler(int signum) {
+    if (signum == SIGINT) {
+        g_emergency_stop.store(true);
+        RCLCPP_WARN(rclcpp::get_logger("signal_handler"), "Emergency stop triggered!");
+        
+        // Give some time for the emergency stop command to be sent
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        rclcpp::shutdown();
     }
 }
 
-class Go2MoveClientNode : public rclcpp::Node 
+double normalize_angle(double a) {
+    while (a > M_PI) a -= 2 * M_PI;
+    while (a < -M_PI) a += 2 * M_PI;
+    return a;
+}
+
+double get_yaw_from_quaternion(const geometry_msgs::msg::Quaternion &q)
+{
+    double siny_cosp = 2 * (q.w * q.z + q.x * q.y);
+    double cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z);
+    return std::atan2(siny_cosp, cosy_cosp);
+}
+
+class Go2TrackNode : public rclcpp::Node 
 {
 public:
-    explicit Go2MoveClientNode(): Node("go2_pathtracking_node"), move_client_(this) 
-    {
-        this->declare_parameter<std::string>("api", "pos");
-        this->declare_parameter<std::string>("strategy", "open_loop");
-        this->declare_parameter<int>("control_hz", 50);
-        this->declare_parameter<bool>("is_ai_ctl", true);
+    Go2TrackNode(): Node("go2_pathtracking_node"), move_client_(this), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
+    {   
+        path_dt_ = declare_parameter<double>("path_dt", 0.1);
+        control_hz_ = declare_parameter<int>("control_hz", 10);
+        strategy_ = declare_parameter<std::string>("strategy", "open_loop");
 
-        api_mode_ = this->get_parameter("api").as_string();
-        strategy_ = this->get_parameter("strategy").as_string();
-        control_hz_ = this->get_parameter("control_hz").as_int();
-        is_ai_ctl_ = this->get_parameter("is_ai_ctl").as_bool();
+        map_frame_ = declare_parameter<std::string>("map_frame", "map");
+        robot_odom_frame_ = declare_parameter<std::string>("robot_odom_frame", "odom");
+        robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link");
 
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] API mode: %s, Strategy: %s, Control Hz: %d, AI Control: %s", 
-                   api_mode_.c_str(), strategy_.c_str(), control_hz_, is_ai_ctl_ ? "true" : "false");
-        
+        is_ai_ctl_ = declare_parameter<bool>("is_ai_ctl", true);
+        api_mode_  = declare_parameter<std::string>("api", "pos");
+
+        kp_linear_ = declare_parameter<double>("kp_linear", 1.0);
+        kd_linear_ = declare_parameter<double>("kd_linear", 0.1);
+
+        kp_angular_ = declare_parameter<double>("kp_angular", 2.0);
+        kd_angular_ = declare_parameter<double>("kd_angular", 0.2);
+
+        if (is_ai_ctl_) {
+            max_vel_x_ = 0.6;
+            max_vel_y_ = 0.4;
+            max_vel_yaw_ = 0.8; 
+        }  else {
+            max_vel_x_ = 2.5;
+            max_vel_y_ = 1.0;
+            max_vel_yaw_ = 4.0; 
+        }
+
+        max_pos_error_ = declare_parameter<double>("max_pos_error", 0.3);
+        feedforward_ramp_time_ = declare_parameter<double>("feedforward_ramp_time", 0.2);
+
+        pos_from_ = declare_parameter<std::string>("pos_from", "topic");
+        path_topic_ = declare_parameter<std::string>("path_topic", "/planned_path");
+
         // --------------------------------------------------------------------------------
-        // subscribers
         state_suber_ = this->create_subscription<unitree_go::msg::SportModeState>(
             "lf/sportmodestate", 
-            1,
-            std::bind(&Go2MoveClientNode::statecallback, this, _1)
-        );
+            20,
+            std::bind(&Go2TrackNode::_statecallback, this, _1));
 
-        plan_path_suber_ = this->create_subscription<nav_msgs::msg::Path>(
-            "/planned_path", 
-            1, 
-            std::bind(&Go2MoveClientNode::plannercallback, this, _1)
+        path_suber_ = this->create_subscription<nav_msgs::msg::Path>(
+            path_topic_, 
+            5, 
+            std::bind(&Go2TrackNode::PathCallback, this, _1)
         );
 
         response_suber_ = this->create_subscription<unitree_api::msg::Response>(
             "/api/sport/response",
             10,
-            std::bind(&Go2MoveClientNode::responsecallback, this, _1)
+            std::bind(&Go2TrackNode::_responsecallback, this, _1)
         );
-        
+
         // --------------------------------------------------------------------------------
-        // control loop for vel control
-        if (api_mode_ == "vel") {
-            control_thread_ = std::thread([this] { MoveApiControlLoop(); });
-        } else if (api_mode_ != "pos") {
-            RCLCPP_ERROR(this->get_logger(), "[PathTracking] Unknown API mode: %s", api_mode_.c_str());
-        }
-
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] Node initialized successfully");
-    }
-
-    ~Go2MoveClientNode() {
-        if (api_mode_ == "vel") {
-            if (control_thread_.joinable()) {
-                control_thread_.join();
-            }
-        }
-    }
-
-    void plannercallback(const nav_msgs::msg::Path::SharedPtr msg) {  
-        
-        std::lock_guard<std::mutex> lock(path_mutex_);
-
-        size_t N = msg->poses.size();
-        if (N == 0) {
-            RCLCPP_WARN(this->get_logger(), "Received empty path.");
-            plan_path_local_.resize(0, 3);
-            plan_path_global_.resize(0, 3);
-            return;
-        }
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] Received planned path ros2 msg with %zu points ", N);
-
-        // extract x, y, yaw from ros msg
-        plan_path_local_.resize(N, 3);
-        for (size_t i = 0; i < N; ++i) {
-            const auto& pose = msg->poses[i].pose;
-
-            tf2::Quaternion q(
-                pose.orientation.x,
-                pose.orientation.y,
-                pose.orientation.z,
-                pose.orientation.w);
-            double roll, pitch, yaw;
-            tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
-            plan_path_local_(i, 0) = pose.position.x;
-            plan_path_local_(i, 1) = pose.position.y;
-            plan_path_local_(i, 2) = yaw;
-        }
-        
-        // Debug: print first point before transformation
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point local: x=%.3f, y=%.3f, yaw=%.3f", 
-                plan_path_local_(0, 0), plan_path_local_(0, 1), plan_path_local_(0, 2));
-        
-        // transform planned path from local to global 
-        Eigen::MatrixXd traj_global(N, 3);
-        Eigen::Matrix2d R;
-        R << cos(yaw0_), -sin(yaw0_),
-            sin(yaw0_),  cos(yaw0_);
-        Eigen::MatrixXd XY_local =  plan_path_local_.leftCols(2).transpose();
-        Eigen::MatrixXd XY_global = (R * XY_local).colwise() + Eigen::Vector2d(px0_, py0_);
-        traj_global.leftCols(2) = XY_global.transpose();
-        traj_global.col(2) = plan_path_local_.col(2).array() + yaw0_;
-        
-        plan_path_global_ = traj_global;
-        
-        // Debug: print first point after transformation
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] First point global: x=%.3f, y=%.3f, yaw=%.3f", 
-                plan_path_global_(0, 0), plan_path_global_(0, 1), plan_path_global_(0, 2));
-        
-        // apply api if needed
         if (api_mode_ == "pos") {
-            RCLCPP_INFO(this->get_logger(), "[PathTracking] Calling FollowTrajApi()");
-            FollowTrajApi();
-        } else if (api_mode_ == "vel") {
-            path_start_time_ = this->get_clock()->now();
-            target_point_idx_ = -1;
+            RCLCPP_INFO(get_logger(), "API mode: %s, which provided by unitree official api", api_mode_.c_str());
+        } else if (api_mode_ == "vel"){
+            control_timer_ = create_wall_timer(
+                std::chrono::duration<double>(1.0 / control_hz_),
+                std::bind(&Go2TrackNode::MoveApiControlLoop, this)
+            );
+            RCLCPP_INFO(get_logger(), "API mode: %s. Control strategy: %s", api_mode_.c_str(), strategy_.c_str());
         } else {
-            RCLCPP_ERROR(this->get_logger(), "[PathTracking] Unknown api mode: %s", api_mode_.c_str());
+            RCLCPP_FATAL(get_logger(), "Invalid api mode: %s, only support [pos, vel]", api_mode_.c_str());
+            rclcpp::shutdown();
         }
+
+        // --------------------------------------------------------------------------------
+        move_client_.BalanceStand(req_);
+        RCLCPP_INFO(get_logger(), "Call BalanceStand APi to be Ready");
     }
 
-    void statecallback(const unitree_go::msg::SportModeState::SharedPtr msg) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        state_ = *msg;
-
-        RCLCPP_DEBUG(this->get_logger(), "Position: %.3f, %.3f, %.3f", 
-            state_.position[0], state_.position[1], state_.position[2]);
-        RCLCPP_DEBUG(this->get_logger(), "IMU rpy: %.3f, %.3f, %.3f",
-            state_.imu_state.rpy[0], state_.imu_state.rpy[1], state_.imu_state.rpy[2]);
+    void emergency_stop() {
+        RCLCPP_WARN(get_logger(), "Emergency stop activated - sending zero velocity");
+        move_client_.StopMove(req_);
+        emergency_stop_active_.store(true);
     }
 
-    void responsecallback(const unitree_api::msg::Response::SharedPtr msg) {
+private:
+
+    void _responsecallback(const unitree_api::msg::Response::SharedPtr msg) {
         auto api_id = msg->header.identity.api_id;
         auto code = msg->header.status.code;
+
+        std::string api_name;
+        switch (api_id) {
+            case ROBOT_SPORT_API_ID_MOVE: 
+                api_name = "MOVE"; 
+                break;
+            case ROBOT_SPORT_API_ID_TRAJECTORYFOLLOW: 
+                api_name = "TRAJECTORYFOLLOW"; 
+                break;
+            case ROBOT_SPORT_API_ID_BALANCESTAND: 
+                api_name = "BALANCESTAND"; 
+                break;
+            case ROBOT_SPORT_API_ID_STOPMOVE: 
+                api_name = "STOPMOVE"; 
+                break;
+            default:
+                return;
+        }
+
+        std::string code_desc;
+        switch (code) {
+            case 0: code_desc = "success"; break;
+            case -1: code_desc = "task timeout"; break;
+            case -2: code_desc = "task unknown error"; break;
+            default: code_desc = "unknown"; break;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "[PathTracking] API Response - ID: %d (%s), Code: %d (%s)", 
+                    api_id, api_name.c_str(), code, code_desc.c_str());
+
+        if (code != 0) {
+            RCLCPP_ERROR(this->get_logger(), "[PathTracking] API call failed: %s", code_desc.c_str());
+        }
+    }
+
+    void _statecallback(const unitree_go::msg::SportModeState::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_ = *msg;
+    }
+
+    void update_current_pose(){
         
-        // Only process MOVE and TRAJECTORYFOLLOW API responses
-        if (api_id == ROBOT_SPORT_API_ID_MOVE || api_id == ROBOT_SPORT_API_ID_TRAJECTORYFOLLOW) {
-            std::string api_name = (api_id == ROBOT_SPORT_API_ID_MOVE) ? "MOVE" : "TRAJECTORYFOLLOW";
-            std::string code_desc;
-            
-            switch (code) {
-                case 0: code_desc = "success"; break;
-                case -1: code_desc = "task timeout"; break;
-                case -2: code_desc = "task unknown error"; break;
-                default: code_desc = "unknown"; break;
+        if (pos_from_ == "tf") {
+            try {
+                geometry_msgs::msg::TransformStamped transform = tf_buffer_.lookupTransform(
+                    robot_odom_frame_, robot_base_frame_, 
+                    tf2::TimePointZero, 
+                    tf2::durationFromSec(0.1)
+                );
+                current_x_ = transform.transform.translation.x;
+                current_y_ = transform.transform.translation.y;
+                current_yaw_ = get_yaw_from_quaternion(transform.transform.rotation);
+                
+                return;
+            } 
+            catch (tf2::TransformException &ex) {
+                RCLCPP_ERROR(get_logger(), "Call StopMove Api. TF lookup failed for %s", ex.what());
+                move_client_.StopMove(req_);
+                return;
             }
-            
-            RCLCPP_INFO(this->get_logger(), "[PathTracking] API Response - ID: %d (%s), Code: %d (%s)", 
-                       api_id, api_name.c_str(), code, code_desc.c_str());
-            
-            if (code != 0) {
-                RCLCPP_ERROR(this->get_logger(), "[PathTracking] API call failed: %s", code_desc.c_str());
-            }
+        } else if (pos_from_ == "topic") {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            current_x_ = state_.position[0];
+            current_y_ = state_.position[1];
+            current_yaw_ = state_.imu_state.rpy[2];
         }
     }
 
-    void SetInitState(const unitree_go::msg::SportModeState& msg) {
-        px0_ = msg.position[0];
-        py0_ = msg.position[1];
-        yaw0_ = msg.imu_state.rpy[2];
+    /** 
+        - extract x, y, yaw, vx, vy, vyaw from ros Path msg 
+        - vx, vy, vyaw is reference velocity for open-loop
+        - reset Error
+    **/ 
+    void PathCallback(const nav_msgs::msg::Path::SharedPtr msg) {  
+        
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        
+        size_t N = msg->poses.size();
+        if (N < 2) {
+            RCLCPP_WARN(get_logger(), "Received path with less than 2 points, ignoring");
+            plan_path_local_.resize(0, 6);
+            plan_path_global_.resize(0, 6);
+            return;
+        }
 
-        RCLCPP_INFO(this->get_logger(),
-            "[PathTracking] Initial robot state set - x: %.3f, y: %.3f, yaw: %.3f",
-            px0_, py0_, yaw0_);
-    }
+        // 1. get x, y, yaw with init state 0,0,0
+        plan_path_local_ = Eigen::MatrixXd::Zero(N+1, 6);
+        for (size_t i = 0; i < N; ++i) {
+            double x = msg->poses[i].pose.position.x;
+            double y = msg->poses[i].pose.position.y;
+            double yaw = get_yaw_from_quaternion(msg->poses[i].pose.orientation);
 
-    void ClampVelocity(double& vx, double& vy, double& vyaw) {
-        if (is_ai_ctl_) {
-            // AI control limits
-            vx = std::clamp(vx, -0.6, 0.6);
-            vy = std::clamp(vy, -0.4, 0.4);
-            vyaw = std::clamp(vyaw, -0.8, 0.8);
-        } else {
-            // Non-AI control limits
-            vx = std::clamp(vx, -2.5, 3.8);
-            vy = std::clamp(vy, -1.0, 1.0);
-            vyaw = std::clamp(vyaw, -4.0, 4.0);
+            plan_path_local_(i+1, 0) = x;
+            plan_path_local_(i+1, 1) = y;
+            plan_path_local_(i+1, 2) = yaw;
+        }
+        
+        // 2. compute (vx, vy, vyaw) from [i+1] - [i]
+        // and the last is zero
+        for (size_t i = 0; i < N; ++i) {
+            double vx   = (plan_path_local_(i+1, 0) - plan_path_local_(i, 0)) / path_dt_;
+            double vy   = (plan_path_local_(i+1, 1) - plan_path_local_(i, 1)) / path_dt_;
+            double vyaw = normalize_angle(plan_path_local_(i+1, 2) - plan_path_local_(i, 2)) / path_dt_;
+
+            plan_path_local_(i, 3) = vx;
+            plan_path_local_(i, 4) = vy;
+            plan_path_local_(i, 5) = vyaw;
+        }
+
+        // 3. path verison
+        path_version_.fetch_add(1);
+        path_updated_ = true;
+        RCLCPP_INFO(get_logger(), "#########################################");
+        RCLCPP_INFO(get_logger(), "New path received with %zu points, version: %lu, strategy: %s", 
+                   N, path_version_.load(), strategy_.c_str());
+        path_start_time_ = now();
+
+        // 4. transform from local (in base_link frame) to global(in odom frame) 
+        update_current_pose();
+        if (api_mode_ == "pos") {
+            plan_path_global_ = plan_path_local_;
+            plan_path_global_.leftCols(3) = plan_path_local_.leftCols(3);
+
+            Eigen::Matrix2d R;
+            R << cos(current_yaw_), -sin(current_yaw_),
+                sin(current_yaw_),  cos(current_yaw_);
+            Eigen::MatrixXd XY_local =  plan_path_local_.leftCols(2).transpose();
+            Eigen::MatrixXd XY_global = (R * XY_local).colwise() + Eigen::Vector2d(current_x_, current_y_);
+            
+            plan_path_global_.leftCols(2) = XY_global.transpose();
+            plan_path_global_.col(2) = plan_path_local_.col(2).array() + current_yaw_;
+
+            Eigen::MatrixXd Vxy_local = plan_path_local_.block(0, 3, N+1, 2).transpose();
+            Eigen::MatrixXd Vxy_global = R * Vxy_local;
+
+            plan_path_global_.block(0, 3, N+1, 2) = Vxy_global.transpose();
+            plan_path_global_.col(5) = plan_path_local_.col(5).array();
+            
+            RCLCPP_INFO(this->get_logger(), "[PathTracking] Calling FollowTrajApi()");
+            FollowTrajApi();
+        } else if (strategy_ == "pd") {
+            // reset for pd control states
+            path_start_pos_global_ = {current_x_, current_y_, current_yaw_};
+            prev_pos_error_ = {0.0, 0.0, 0.0};
+            prev_time_valid_ = false;
         }
     }
 
+    //----------------------------------------------------------
     // trajectory following api need global coord
+
     void FollowTrajApi() {
-        Eigen::MatrixXd plan_path_copy;
-        unitree_go::msg::SportModeState state_copy;
-        {
-            // Use C++17 structured binding to lock two mutexes safely
-            std::scoped_lock lock(path_mutex_, state_mutex_);
-            plan_path_copy = plan_path_global_;
-            state_copy = state_;
+        
+        // check path
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        uint64_t latest_version = path_version_.load();
+        if (current_path_version_ != latest_version) {
+            current_path_version_ = latest_version;
+            RCLCPP_INFO(get_logger(), "Switched to path version: %lu", current_path_version_.load());
+        }
+        if (!path_updated_ || plan_path_global_.rows() == 0) {
+            move_client_.StopMove(req_);
+            RCLCPP_INFO(get_logger(), "Empty Path. Call StopMove Api");
+            return;
         }
 
-        int N = plan_path_copy.rows();
-        
-        // diff to get vel
-        Eigen::RowVector3d current;
-        double current_x = state_copy.position[0];
-        double current_y = state_copy.position[1];
-        double current_yaw = state_copy.imu_state.rpy[2];
-        current << current_x, current_y, current_yaw;
-        Eigen::MatrixXd traj_aug(N+1, 3);
-        traj_aug << current, plan_path_copy;  
-        Eigen::MatrixXd vel = (traj_aug.bottomRows(N) - traj_aug.topRows(N)) / traj_interval_s_;
-        RCLCPP_INFO(this->get_logger(), "[PathTracking] Compute vel - global: vx=%.3f, vy=%.3f, vyaw=%.3f", 
-                   vel(0, 0), vel(0, 1), vel(0, 2));
-
-        // ----------------------------------------------------------
         // convert to api format
         std::vector<PathPoint> path;
-        for (int i = 0; i < 30; i++) {
+        for (int i = 1; i <= 30; i++) {
             PathPoint path_point;
-            path_point.timeFromStart = (i + 1) * traj_interval_s_;
+            path_point.timeFromStart = i * path_dt_;
 
-            if (i < N) {
-                path_point.x = plan_path_copy(i, 0);
-                path_point.y = plan_path_copy(i, 1);
-                path_point.yaw = plan_path_copy(i, 2);
-                path_point.vx = vel(i, 0);
-                path_point.vy = vel(i, 1);
-                path_point.vyaw = vel(i, 2);
-                
-                // Apply velocity limits
-                ClampVelocity(path_point.vx, path_point.vy, path_point.vyaw);
+            if (i < plan_path_global_.rows()) {
+                path_point.x = plan_path_global_(i, 0);
+                path_point.y = plan_path_global_(i, 1);
+                path_point.yaw = plan_path_global_(i, 2);
+                path_point.vx = std::clamp(plan_path_global_(i, 3), -max_vel_x_, max_vel_x_);
+                path_point.vy = std::clamp(plan_path_global_(i, 4), -max_vel_y_, max_vel_y_);
+                path_point.vyaw = std::clamp(plan_path_global_(i, 5), -max_vel_yaw_, max_vel_yaw_);
             } else {
                 // repeat the last one
                 path_point.x = path.back().x;
@@ -260,184 +322,208 @@ public:
                 path_point.vy = 0.0;
                 path_point.vyaw = 0.0;
             }
-
             path.push_back(path_point);
         }
-        // ----------------------------------------------------------
-        // Print first trajectory point for debugging
-        if (!path.empty()) {
-            RCLCPP_INFO(this->get_logger(), 
-                "[PathTracking FollowTrajApi] First trajectory point - x: %.3f, y: %.3f, yaw: %.3f, vx: %.3f, vy: %.3f, vyaw: %.3f",
-                path[0].x, path[0].y, path[0].yaw, path[0].vx, path[0].vy, path[0].vyaw);
-        }
-        
-        try {
-            move_client_.TrajectoryFollow(req_, path);
-            RCLCPP_INFO(this->get_logger(), "[PathTracking] TrajectoryFollow api sent successfully");
-        } catch (const std::exception& e) {
-            RCLCPP_ERROR(this->get_logger(), "[PathTracking] TrajectoryFollow api failed: %s", e.what());
-        }
+        move_client_.TrajectoryFollow(req_, path);
+        RCLCPP_INFO(this->get_logger(), "Call TrajectoryFollow API");
     }
 
-    // velocity following api need local coord
+    //----------------------------------------------------------
+
     void MoveApiControlLoop() {
-        rclcpp::Rate rate(control_hz_);
-        
-        while (rclcpp::ok()) {
-            Eigen::MatrixXd plan_path_copy;
-            unitree_go::msg::SportModeState state_copy;
-            {
-                std::scoped_lock lock(path_mutex_, state_mutex_);
-                plan_path_copy = plan_path_local_;
-                state_copy = state_;
-            }
-            int n_pts = plan_path_copy.rows();
 
-            if (n_pts > 0) {
-                auto current_time = this->get_clock()->now();
-                double elapsed_time = (current_time - path_start_time_).seconds();
-                double x_r = state_copy.position[0];
-                double y_r = state_copy.position[1];
-                double yaw_r = state_copy.imu_state.rpy[2];
-
-                // interpolate to get target in local coord
-                int idx0 = std::min(static_cast<int>(elapsed_time / traj_interval_s_), n_pts - 1);
-                int idx1 = std::min(idx0 + 1, n_pts - 1);
-                double t0 = idx0 * traj_interval_s_;
-                double t1 = idx1 * traj_interval_s_;
-                double alpha = (t1 - t0 > 1e-6) ? (elapsed_time - t0) / (t1 - t0) : 0.0;
-
-                double x0 = plan_path_copy(idx0, 0);
-                double y0 = plan_path_copy(idx0, 1);
-                double yaw0 = plan_path_copy(idx0, 2);
-                double x1 = plan_path_copy(idx1, 0);
-                double y1 = plan_path_copy(idx1, 1);
-                double yaw1 = plan_path_copy(idx1, 2);
-                double x_target = (1 - alpha) * x0 + alpha * x1;
-                double y_target = (1 - alpha) * y0 + alpha * y1;
-                double yaw_target = yaw0 + alpha * angle_utils::shortest_angular_distance(yaw0, yaw1);
-
-                double vx, vy, vyaw;
-                if (strategy_ == "open_loop") {
-                    vx = (x_target - x_r) * control_hz_;
-                    vy = (y_target - y_r) * control_hz_;
-                    vyaw = angle_utils::shortest_angular_distance(yaw_r, yaw_target) * control_hz_;
-                } else if (strategy_ == "pd") {
-                    vx = kp_linear_ * (x_target - x_r);
-                    vy = kp_linear_ * (y_target - y_r);
-                    vyaw = kp_angular_ * angle_utils::shortest_angular_distance(yaw_r, yaw_target);
-                } else {
-                    vx = vy = vyaw = 0.0;
-                }
-
-                ClampVelocity(vx, vy, vyaw);
-
-                try {
-                    move_client_.Move(req_, vx, vy, vyaw);
-                    RCLCPP_INFO(this->get_logger(), "[PathTracking] Move api sent successfully");
-                } catch (const std::exception& e) {
-                    RCLCPP_ERROR(this->get_logger(), "[PathTracking] Move api failed: %s", e.what());
-                }
-                
-                if (target_point_idx_ != idx0) {
-                    target_point_idx_ = idx0;
-                    RCLCPP_DEBUG(this->get_logger(),
-                                "[PathTracking] t=%.2f idx=%d: x=%.3f y=%.3f yaw=%.3f, cmd vx=%.3f vy=%.3f vyaw=%.3f",
-                                elapsed_time, idx0, x_target, y_target, yaw_target, vx, vy, vyaw);
-                }
-            }
-
-            rate.sleep();
+        if (emergency_stop_active_.load() || g_emergency_stop.load()) {
+            move_client_.StopMove(req_);
+            RCLCPP_INFO(get_logger(), "Emergency Stop. Call StopMove Api");
+            return;
         }
+        if (strategy_ == "pd") {
+            update_current_pose();
+        }
+        
+        // check path
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        uint64_t latest_version = path_version_.load();
+        if (current_path_version_ != latest_version) {
+            current_path_version_ = latest_version;
+            RCLCPP_INFO(get_logger(), "Switched to path version: %lu", current_path_version_.load());
+        }
+        if (!path_updated_ || plan_path_local_.rows() == 0) {
+            move_client_.StopMove(req_);
+            RCLCPP_INFO(get_logger(), "Empty Path. Call StopMove Api");
+            return;
+        }
+        auto current_time = now();
+        double elapsed_time = (current_time - path_start_time_).seconds();
+        bool at_path_end = (elapsed_time / path_dt_) >= (plan_path_local_.rows() - 1);
+        if (at_path_end) {
+            RCLCPP_INFO(get_logger(), "Path execution completed. Call StopMove Api");
+            path_updated_ = false;
+            move_client_.StopMove(req_);
+            return;
+        }
+
+        // start control strategy
+        double x_vel = 0.0;
+        double y_vel = 0.0;
+        double yaw_vel = 0.0;
+
+        if (strategy_ == "open_loop") {
+            std::tie(x_vel, y_vel, yaw_vel) = calculate_openloop_control(elapsed_time);
+        } 
+        else if (strategy_ == "pd") {
+            std::tie(x_vel, y_vel, yaw_vel) = calculate_pd_control(elapsed_time);
+        }   
+
+        // Apply velocity limits
+        x_vel = std::clamp(x_vel, -max_vel_x_, max_vel_x_);
+        y_vel = std::clamp(y_vel, -max_vel_y_, max_vel_y_);
+        yaw_vel = std::clamp(yaw_vel, -max_vel_yaw_, max_vel_yaw_);
     }
 
-private:
-    std::string api_mode_;
-    std::string strategy_;
-    int control_hz_;
-    bool is_ai_ctl_;
-    
-    double kp_linear_ = 2.0;
-    double kp_angular_ = 1.5;
+    std::pair<double, double, double> calculate_openloop_control(double elapsed_time){
+        
+        double subgoal_idx = elapsed_time / path_dt_;
+        size_t cur_idx = static_cast<size_t>(subgoal_idx);
 
-    double px0_{}, py0_{}, yaw0_{};
-    double traj_interval_s_ = 0.1;
+        double x_vel = plan_path_local_(cur_idx,3);
+        double y_vel = plan_path_local_(cur_idx,4);
+        double angular_vel = plan_path_local_(cur_idx,5);
 
-    // Robot state
-    rclcpp::Subscription<unitree_go::msg::SportModeState>::SharedPtr state_suber_;
-    unitree_go::msg::SportModeState state_;
-    std::mutex state_mutex_;
+        return {x_vel, y_vel, angular_vel};
+    }
 
-    // API client
+    std::pair<double, double, double> calculate_pd_control(double elapsed_time){
+        
+        size_t subgoal_idx = static_cast<size_t>(elapsed_time / path_dt_) + 1;
+        
+        // error in path start frame
+        double x0 = path_start_pos_global_[0];
+        double y0 = path_start_pos_global_[1];
+        double yaw0 = path_start_pos_global_[2];
+        double current_x_local_ = cos(yaw0) * (current_x_ - x0) + sin(yaw0) * (current_y_ - y0);
+        double current_y_local_ = -sin(yaw0) * (current_x_ - x0) + cos(yaw0) * (current_y_ - y0);
+        double current_yaw_local_ = normalize_angle(current_yaw_ - yaw0);
+        std::array<double, 3> pos_error = {
+            plan_path_local_(subgoal_idx,0) - current_x_local_, 
+            plan_path_local_(subgoal_idx,1) - current_y_local_, 
+            normalize_angle(plan_path_local_(subgoal_idx,2)- current_yaw_local_)
+        };
+        double pos_err_mag = std::hypot(pos_error[0], pos_error[1]);
+        if (pos_err_mag > max_pos_error_) {
+            pos_error[0] *= (max_pos_error_ / pos_err_mag);
+            pos_error[1] *= (max_pos_error_ / pos_err_mag);
+        }
+
+        // pd
+        std::array<double, 3> desired_vel_pd;
+        auto now_time = now();
+        if (prev_time_valid_) {
+            double dt = (now_time - prev_time_).seconds();
+            desired_vel_pd = {
+                kp_linear_  * pos_error[0] + kd_linear_  * (pos_error[0] - prev_pos_error_[0]) / dt,
+                kp_linear_  * pos_error[1] + kd_linear_  * (pos_error[1] - prev_pos_error_[1]) / dt,
+                kp_angular_ * pos_error[2] + kd_angular_ * (pos_error[2] - prev_pos_error_[2]) / dt
+            };
+        } else {
+            desired_vel_pd = {
+                kp_linear_  * pos_error[0], 
+                kp_linear_  * pos_error[1],
+                kp_angular_ * pos_error[2]
+            };
+            prev_time_valid_ = true;
+        }
+        
+        // feedward
+        std::array<double, 3> ref_vel = {
+            plan_path_local_(subgoal_idx-1, 3), 
+            plan_path_local_(subgoal_idx-1, 4), 
+            plan_path_local_(subgoal_idx-1, 5)
+        };
+        double feedforward_weight = std::min(1.0, elapsed_time / feedforward_ramp_time_);
+        std::array<double, 3> total_desired_vel = {
+            feedforward_weight * ref_vel[0] + desired_vel_pd[0],
+            feedforward_weight * ref_vel[1] + desired_vel_pd[1],
+            feedforward_weight * ref_vel[2] + desired_vel_pd[2]
+        };
+        
+        prev_time_ = now_time;
+        prev_pos_error_ = pos_error;
+
+        // transform to base_link frame
+        double dyaw = current_yaw_ - yaw0;
+        double x_vel =  total_desired_vel[0] * cos(dyaw) + total_desired_vel[1] * sin(dyaw);
+        double y_vel = -total_desired_vel[0] * sin(dyaw) + total_desired_vel[1] * cos(dyaw);
+        double angular_vel = total_desired_vel[2];
+
+        return {x_vel, y_vel, angular_vel};
+    }
+
+    //----------------------------------------------------------
+    // Emergency stop state
+    std::atomic<bool> emergency_stop_active_{false};
+
+    // ros msg path
+    std::string path_topic_;
+    double path_dt_;
+    std::mutex path_mutex_;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_suber_;
+    Eigen::MatrixXd plan_path_local_;       // [n, 6]  x, y, yaw, vx, vy, vyaw in local
+    Eigen::MatrixXd plan_path_global_;      // [n, 6]  x, y, yaw, vx, vy, vyaw in global
+    std::atomic<uint64_t> path_version_{0};
+    std::atomic<uint64_t> current_path_version_{0};
+    bool path_updated_ = false;
+    rclcpp::Time path_start_time_;
+
+    // ros api client
     Go2MoveClient move_client_;
     unitree_api::msg::Request req_;
     rclcpp::Subscription<unitree_api::msg::Response>::SharedPtr response_suber_;
+    double max_vel_x_ = 0.0, max_vel_y_ = 0.0, max_vel_yaw_ = 0.0; 
 
-    // plan path
-    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr plan_path_suber_;
-    std::mutex path_mutex_;
-    Eigen::MatrixXd plan_path_local_;       // [n, 3]  x, y, yaw in local
-    Eigen::MatrixXd plan_path_global_;      // [n, 3]  x, y, yaw in global
+    // tf for close-loop control
+    std::string pos_from_;
+    tf2_ros::Buffer tf_buffer_;
+    tf2_ros::TransformListener tf_listener_;
+    std::string map_frame_, robot_odom_frame_, robot_base_frame_;
+    double current_x_ = 0.0, current_y_ = 0.0, current_yaw_ = 0.0;
+    
+    // state topic for close-loop control or transform to init
+    rclcpp::Subscription<unitree_go::msg::SportModeState>::SharedPtr state_suber_;
+    unitree_go::msg::SportModeState state_;
+    std::mutex state_mutex_;
+    
+    // control strategy
+    std::string strategy_;
+    rclcpp::TimerBase::SharedPtr control_timer_;
+    int control_hz_;
 
-    // VEL TRACK
-    int target_point_idx_ = -1;
-    rclcpp::Time path_start_time_;
+    std::string api_mode_;
+    bool is_ai_ctl_;
+    
+    // pd + feedforward
+    std::array<double,3> path_start_pos_global_ = {0.0,0.0, 0.0};
+    std::array<double,3> prev_pos_error_ = {0.0,0.0, 0.0};
+    double max_pos_error_;
+    double kp_linear_, kd_linear_;
+    double kp_angular_, kd_angular_;
+    double feedforward_ramp_time_;
 
-    // Threads
-    std::thread control_thread_;
+    rclcpp::Time prev_time_;
+    bool prev_time_valid_ = false;
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv) 
+{
     rclcpp::init(argc, argv);
+    auto node = std::make_shared<Go2TrackNode>();
 
-    auto node = std::make_shared<Go2MoveClientNode>();
-    
-    // Wait for the first state message to safely get the initial pose
-    RCLCPP_INFO(node->get_logger(), "Waiting for the first state message on /lf/sportmodestate...");
-    
-    unitree_go::msg::SportModeState::SharedPtr init_state_msg = nullptr;
-    bool received_initial_state = false;
-    
-    // Create temporary subscription to wait for first message
-    auto temp_sub = node->create_subscription<unitree_go::msg::SportModeState>(
-        "/lf/sportmodestate", 1,
-        [&](const unitree_go::msg::SportModeState::SharedPtr msg) {
-            init_state_msg = msg;
-            received_initial_state = true;
-        });
-    
-    // Wait for initial state with timeout
-    auto start_time = std::chrono::steady_clock::now();
-    auto timeout = std::chrono::seconds(5);
-    
-    while (!received_initial_state && rclcpp::ok()) {
-        rclcpp::spin_some(node);
-        
-        auto elapsed = std::chrono::steady_clock::now() - start_time;
-        if (elapsed > timeout) {
-            RCLCPP_ERROR(node->get_logger(), "Timed out waiting for initial state message.");
-            rclcpp::shutdown();
-            return -1;
-        }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    
-    // Remove temporary subscription
-    temp_sub.reset();
-    
-    if (init_state_msg) {
-        node->SetInitState(*init_state_msg);
-    } else {
-        RCLCPP_ERROR(node->get_logger(), "Failed to get initial state message.");
-        rclcpp::shutdown();
-        return -1;
-    }
+    // Register signal handler for Ctrl+C
+    signal(SIGINT, signal_handler);
 
-    rclcpp::executors::MultiThreadedExecutor executor;
-    executor.add_node(node);
-    executor.spin();
+    RCLCPP_INFO(node->get_logger(), "Emergency stop enabled - press Ctrl+C to stop robot");
     
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
