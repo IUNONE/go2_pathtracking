@@ -1,8 +1,6 @@
-cmake_minimum_required(VERSION 3.5  tf2_ros
-  tf2_msgs
-  geometry_msgs
-)
+cmake_minimum_required(VERSION 3.5)
 project(go2_pathtracking)
+cmake_policy(SET CMP0057 NEW)
 
 # Default to C99
 if(NOT CMAKE_C_STANDARD)
