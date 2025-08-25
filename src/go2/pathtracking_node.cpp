@@ -382,6 +382,11 @@ private:
         x_vel = std::clamp(x_vel, -max_vel_x_, max_vel_x_);
         y_vel = std::clamp(y_vel, -max_vel_y_, max_vel_y_);
         yaw_vel = std::clamp(yaw_vel, -max_vel_yaw_, max_vel_yaw_);
+
+        move_client_.Move(req_, x_vel, y_vel, yaw_vel);
+        RCLCPP_INFO(get_logger(), "Call Move Api vx: %.6f, vy: %.6f, vyaw: %.6f",
+            x_vel, y_vel, yaw_vel);
+
     }
 
     std::tuple<double, double, double> calculate_openloop_control(double elapsed_time){
