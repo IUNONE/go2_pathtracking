@@ -45,6 +45,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(ZeroMQ REQUIRED)
 
 # reader
 add_executable(read_low_state src/reader/read_low_state.cpp)
@@ -61,6 +62,11 @@ add_executable(test_node src/test_track_node.cpp)
 
 ament_target_dependencies(pathtracking_node ${DEPENDENCY_LIST})
 target_link_libraries(pathtracking_node Eigen3::Eigen)
+
+add_executable(pathtracking_zmq_node src/go2/pathtracking_zmq_node.cpp src/common/go2_move_client.cpp)
+ament_target_dependencies(pathtracking_zmq_node ${DEPENDENCY_LIST})
+target_link_libraries(pathtracking_zmq_node Eigen3::Eigen)
+target_link_libraries(pathtracking_zmq_node ${ZeroMQ_LIBRARIES})
 
 ament_target_dependencies(test_node
   rclcpp

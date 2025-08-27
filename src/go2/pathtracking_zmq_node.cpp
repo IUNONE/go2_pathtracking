@@ -20,7 +20,10 @@
 #include "unitree_api/msg/response.hpp"
 
 #include "go2_move_client.h"
-
+#include <zmq.hpp>
+#include <vector>
+#include <atomic>
+#include <thread> // For std::thread
 
 // Global variables for signal handling
 std::atomic<bool> g_emergency_stop{false};
@@ -53,7 +56,8 @@ double get_yaw_from_quaternion(const geometry_msgs::msg::Quaternion &q)
 class Go2TrackNode : public rclcpp::Node 
 {
 public:
-    Go2TrackNode(): Node("go2_pathtracking_node"), move_client_(this), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
+    Go2TrackNode(): Node("go2_pathtracking_node"), move_client_(this), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_),
+                    zmq_context_(1), zmq_socket_(zmq_context_, ZMQ_PULL) // Initialize ZeroMQ context and socket
     {   
         path_dt_ = declare_parameter<double>("path_dt", 0.1);
         control_hz_ = declare_parameter<int>("control_hz", 10);
@@ -95,11 +99,22 @@ public:
             20,
             std::bind(&Go2TrackNode::_statecallback, this, _1));
 
-        path_suber_ = this->create_subscription<nav_msgs::msg::Path>(
-            path_topic_, 
-            5, 
-            std::bind(&Go2TrackNode::PathCallback, this, _1)
-        );
+        // path_suber_ = this->create_subscription<nav_msgs::msg::Path>(
+        //     path_topic_, 
+        //     5, 
+        //     std::bind(&Go2TrackNode::PathCallback, this, _1)
+        // );
+        // Initialize ZeroMQ socket and start receive thread
+        try {
+            zmq_socket_.bind("tcp://*:5556");
+            RCLCPP_INFO(get_logger(), "ZeroMQ socket bound to tcp://*:5556");
+            zmq_running_.store(true);
+            zmq_receive_thread_ = std::thread(&Go2TrackNode::ZmqReceiveLoop, this);
+        } catch (const zmq::error_t& e) {
+            RCLCPP_FATAL(get_logger(), "ZeroMQ binding failed: %s", e.what());
+            rclcpp::shutdown();
+        }
+
 
         response_suber_ = this->create_subscription<unitree_api::msg::Response>(
             "/api/sport/response",
@@ -124,6 +139,16 @@ public:
         // --------------------------------------------------------------------------------
         move_client_.BalanceStand(req_);
         RCLCPP_INFO(get_logger(), "Call BalanceStand APi to be Ready");
+    }
+
+    ~Go2TrackNode() {
+        zmq_running_.store(false);
+        if (zmq_receive_thread_.joinable()) {
+            zmq_receive_thread_.join();
+        }
+        zmq_socket_.close();
+        zmq_context_.close(); // Terminate context
+        RCLCPP_INFO(get_logger(), "ZeroMQ resources cleaned up.");
     }
 
     void emergency_stop() {
@@ -206,15 +231,16 @@ private:
     }
 
     /** 
-        - extract x, y, yaw, vx, vy, vyaw from ros Path msg 
+        - Process path data received from ZeroMQ
+        - extract x, y, yaw, vx, vy, vyaw from path_data
         - vx, vy, vyaw is reference velocity for open-loop
         - reset Error
     **/ 
-    void PathCallback(const nav_msgs::msg::Path::SharedPtr msg) {  
+    void ProcessPathData(const Eigen::MatrixXd& path_data) {  
         
         std::lock_guard<std::mutex> lock(path_mutex_);
         
-        size_t N = msg->poses.size();
+        size_t N = path_data.rows();
         if (N < 2) {
             RCLCPP_WARN(get_logger(), "Received path with less than 2 points, ignoring");
             plan_path_local_.resize(0, 6);
@@ -225,9 +251,9 @@ private:
         // 1. get x, y, yaw with init state 0,0,0
         plan_path_local_ = Eigen::MatrixXd::Zero(N+1, 6);
         for (size_t i = 0; i < N; ++i) {
-            double x = msg->poses[i].pose.position.x;
-            double y = msg->poses[i].pose.position.y;
-            double yaw = get_yaw_from_quaternion(msg->poses[i].pose.orientation);
+            double x = path_data(i, 0);
+            double y = path_data(i, 1);
+            double yaw = path_data(i, 2);
 
             plan_path_local_(i+1, 0) = x;
             plan_path_local_(i+1, 1) = y;
@@ -282,6 +308,46 @@ private:
             path_start_pos_global_ = {current_x_, current_y_, current_yaw_};
             prev_pos_error_ = {0.0, 0.0, 0.0};
             prev_time_valid_ = false;
+        }
+    }
+
+    void ZmqReceiveLoop() {
+        while (zmq_running_.load()) {
+            zmq::message_t message;
+            try {
+                // Use ZMQ_DONTWAIT to avoid blocking, allowing the thread to check zmq_running_
+                if (zmq_socket_.recv(message, zmq::recv_flags::dontwait)) {
+                    if (message.size() % sizeof(double) != 0) {
+                        RCLCPP_ERROR(get_logger(), "Received ZeroMQ message size is not a multiple of double size. Ignoring.");
+                        continue;
+                    }
+                    size_t num_elements = message.size() / sizeof(double);
+                    if (num_elements % 3 != 0) {
+                        RCLCPP_ERROR(get_logger(), "Received ZeroMQ message elements not divisible by 3 (expected [n,3] array). Ignoring.");
+                        continue;
+                    }
+                    size_t num_rows = num_elements / 3;
+
+                    Eigen::MatrixXd received_path(num_rows, 3);
+                    const double* data_ptr = static_cast<const double*>(message.data());
+
+                    for (size_t i = 0; i < num_rows; ++i) {
+                        received_path(i, 0) = data_ptr[i * 3 + 0];
+                        received_path(i, 1) = data_ptr[i * 3 + 1];
+                        received_path(i, 2) = data_ptr[i * 3 + 2];
+                    }
+                    RCLCPP_INFO(get_logger(), "Received trajectory data via ZeroMQ. Shape: [%zu, 3]", num_rows);
+                    ProcessPathData(received_path);
+                }
+            } catch (const zmq::error_t& e) {
+                if (e.num() != ETERM) { // Ignore error if context is terminating
+                    RCLCPP_ERROR(get_logger(), "ZeroMQ error during receive: %s", e.what());
+                }
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(get_logger(), "Error processing ZeroMQ message: %s", e.what());
+            }
+            // Small sleep to prevent busy-waiting if no messages are available
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 
@@ -475,13 +541,19 @@ private:
     std::string path_topic_;
     double path_dt_;
     std::mutex path_mutex_;
-    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_suber_;
+    // rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_suber_; // Removed ROS path subscriber
     Eigen::MatrixXd plan_path_local_;       // [n, 6]  x, y, yaw, vx, vy, vyaw in local
     Eigen::MatrixXd plan_path_global_;      // [n, 6]  x, y, yaw, vx, vy, vyaw in global
     std::atomic<uint64_t> path_version_{0};
     std::atomic<uint64_t> current_path_version_{0};
     bool path_updated_ = false;
     rclcpp::Time path_start_time_;
+
+    // ZeroMQ members
+    zmq::context_t zmq_context_;
+    zmq::socket_t zmq_socket_;
+    std::thread zmq_receive_thread_;
+    std::atomic<bool> zmq_running_;
 
     // ros api client
     Go2MoveClient move_client_;
